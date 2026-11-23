@@ -163,6 +163,94 @@ describe('NotificationEngine', () => {
     expect(ports.events).toEqual([{ kind: 'question', sessionId: 'a', title: 'a', detail: '' }])
   })
 
+  it('raises nothing for pending interactions already present at seedPending', () => {
+    const ports = makePorts()
+    const engine = new NotificationEngine(ports)
+    engine.seedPending(pendingMap([pending('a', 'question', 'q1', 'already waiting')]))
+    engine.observePending(pendingMap([
+      pending('a', 'question', 'q1', 'already waiting'),
+      pending('b', 'approval', 'a1', 'bash'),
+    ]))
+    expect(ports.events).toEqual([{ kind: 'permission', sessionId: 'b', title: 'b', detail: 'bash' }])
+  })
+
+  it('uses the SessionDetail returned by ensureDetail even if detailOf is absent afterwards', async () => {
+    const ports = makePorts({
+      ensureDetail: async () => detail({ finalText: 'background answer', lastUserText: 'background prompt' }),
+      detailOf: () => undefined,
+    })
+    const engine = new NotificationEngine(ports)
+    engine.observe(list({ a: summary('a', true) }))
+    engine.observe(list({ a: summary('a', false) }))
+    await flush()
+    expect(ports.events).toEqual([{
+      kind: 'completed',
+      sessionId: 'a',
+      title: 'background prompt',
+      detail: 'background answer',
+    }])
+  })
+
+  it('ignores stale pre-run turn errors on unopened sessions when a newer user turn succeeded', async () => {
+    const ports = makePorts({
+      ensureDetail: async () => detail({
+        maxTurnErrorSeq: 5,
+        failureMessage: 'old boom',
+        latestUserSeq: 10,
+        lastUserText: 'retry succeeded',
+        finalText: 'all good',
+      }),
+      detailOf: () => undefined,
+    })
+    const engine = new NotificationEngine(ports)
+    engine.observe(list({ a: summary('a', true) }))
+    engine.observe(list({ a: summary('a', false) }))
+    await flush()
+    expect(ports.events).toEqual([{
+      kind: 'completed',
+      sessionId: 'a',
+      title: 'retry succeeded',
+      detail: 'all good',
+    }])
+  })
+
+  it('detects current-turn errors on unopened sessions when turn-error seq exceeds latestUserSeq', async () => {
+    const ports = makePorts({
+      ensureDetail: async () => detail({
+        maxTurnErrorSeq: 12,
+        failureMessage: 'current boom',
+        latestUserSeq: 10,
+        lastUserText: 'do work',
+      }),
+      detailOf: () => undefined,
+    })
+    const engine = new NotificationEngine(ports)
+    engine.observe(list({ a: summary('a', true) }))
+    engine.observe(list({ a: summary('a', false) }))
+    await flush()
+    expect(ports.events).toEqual([{
+      kind: 'failed',
+      sessionId: 'a',
+      title: 'do work',
+      detail: 'current boom',
+    }])
+  })
+
+  it('skips a stale settle when a newer run arms while ensureDetail is loading', async () => {
+    let resolveLoad: ((value: SessionDetail) => void) | undefined
+    const ports = makePorts({
+      ensureDetail: () => new Promise<SessionDetail>(resolve => { resolveLoad = resolve }),
+    })
+    const engine = new NotificationEngine(ports)
+    engine.observe(list({ a: summary('a', true) }))
+    engine.observe(list({ a: summary('a', false) }))
+    await flush()
+    engine.observe(list({ a: summary('a', true) }))
+    resolveLoad?.(detail({ finalText: 'stale' }))
+    await flush()
+    expect(ports.events).toEqual([])
+  })
+
   it('materializes the detail before the settle read', async () => {
     const order: string[] = []
     const ports = makePorts({
@@ -440,6 +528,7 @@ describe('sessionDetailOf', () => {
     ))
     expect(result.lastUserText).toBe('再加个单元测试')
     expect(result.finalText).toBe('已补上 3 个用例')
+    expect(result.latestUserSeq).toBe(3)
   })
 
   it('reports no user text for a chat view without a human message', () => {

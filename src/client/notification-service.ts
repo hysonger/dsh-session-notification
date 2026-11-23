@@ -6,12 +6,13 @@
  * dependency-injected and DOM-free so the classification logic runs under
  * plain vitest; the browser wiring lives in `index.ts`.
  *
- * dsh 0.1.3-alpha.1 data model: the session snapshot still carries no chat
+ * dsh 0.2.2-rc.2+ data model: the session snapshot still carries no chat
  * view or pending interaction — the chat view comes from
- * `uiConversation.binding(binding).target('chat')` and pending interactions
- * from the uiSession session-status source. The engine's session types now come
- * from the api-session-controller client (dsh-client-runtime was dissolved);
- * `AssistantBlock`/`TurnErrorNode` live with the ui-conversation records.
+ * `uiConversation.binding(binding).target('chat')` (while a reference retains
+ * the `conversation` facet, required since 0.2.2-rc.3) and pending
+ * interactions from `ctx.uiSession.pendingInteractions`. The engine's session
+ * types come from the api-session-controller client; `AssistantBlock` /
+ * `TurnErrorNode` live with the ui-conversation records.
  */
 import type { SessionId } from '@deepseek-ai/dsh-client-connection/client'
 import type {
@@ -67,6 +68,8 @@ export interface SessionDetail {
   finalText: string
   /** Text of the latest human user message (the run's subject), when known. */
   lastUserText?: string
+  /** Max seq of materialized user-turn nodes (human or host-authored), when known. */
+  latestUserSeq?: number
 }
 
 /** One classified notification event. */
@@ -86,9 +89,11 @@ export interface NotificationEnginePorts {
   /**
    * Materialize the detail inputs before the settle read (open a session the
    * UI never opened so its chat view can assemble the final assistant text).
-   * Optional and best-effort: a failure must not lose the classification.
+   * May return the detail captured while the temporary retention reference is
+   * live, before it is released. Optional and best-effort: a failure must not
+   * lose the classification.
    */
-  ensureDetail?: (sessionId: SessionId) => Promise<void>
+  ensureDetail?: (sessionId: SessionId) => Promise<SessionDetail | void | undefined>
   /** Human display title of one session. */
   titleOf: (sessionId: SessionId) => string
   /** Wait for trailing wire frames after a running edge (settle window). */
@@ -111,6 +116,7 @@ export interface NotificationEnginePorts {
 interface RunState {
   baselineErrorSeq: number
   baselineAgentError: string | null
+  hadBaselineDetail: boolean
 }
 
 /**
@@ -231,6 +237,18 @@ export class NotificationEngine {
   }
 
   /**
+   * Establish the pending-interaction baseline before live observation: record
+   * pre-existing interaction keys without raising notifications for them.
+   * @param pending - current effective pending interaction per session.
+   */
+  seedPending(pending: ReadonlyMap<SessionId, PendingFacts>): void {
+    for (const [id, facts] of pending) {
+      if (this.silenced(id)) continue
+      this.pendingKeys.set(id, facts.key)
+    }
+  }
+
+  /**
    * Process one uiSession pending-interactions snapshot. A session entering
    * the map (or replacing its interaction — a new key, or a kind switch)
    * raises the question/permission kind; leaving the map raises nothing.
@@ -261,6 +279,7 @@ export class NotificationEngine {
     this.runs.set(id, {
       baselineErrorSeq: detail?.maxTurnErrorSeq ?? 0,
       baselineAgentError: detail?.lastAgentError ?? null,
+      hadBaselineDetail: detail !== undefined,
     })
   }
 
@@ -282,16 +301,29 @@ export class NotificationEngine {
       }
       // A session the user never opened has no loaded history, so its chat
       // view holds no nodes yet; materialize it best-effort before reading.
+      let materialized: SessionDetail | undefined
       try {
-        await this.ports.ensureDetail?.(id)
+        materialized = await this.ports.ensureDetail?.(id) ?? undefined
       } catch {
         // Best effort only: classify from whatever snapshot reads exist.
       }
-      const detail = this.ports.detailOf(id)
-      const failed = detail !== undefined && (
-        detail.maxTurnErrorSeq > run.baselineErrorSeq ||
-        (detail.lastAgentError !== null && detail.lastAgentError !== run.baselineAgentError)
+      // Re-check after awaiting history materialization in case a newer run
+      // started or subagent filtering changed during the async load.
+      if (this.runs.has(id)) return
+      if (this.silenced(id)) {
+        this.prevRunning.delete(id)
+        return
+      }
+      const detail = materialized ?? this.ports.detailOf(id)
+      const turnErrorNew = detail !== undefined && (
+        run.hadBaselineDetail
+          ? detail.maxTurnErrorSeq > run.baselineErrorSeq
+          : detail.maxTurnErrorSeq > 0 && detail.maxTurnErrorSeq > (detail.latestUserSeq ?? 0)
       )
+      const agentErrorNew = detail !== undefined
+        && detail.lastAgentError !== null
+        && detail.lastAgentError !== run.baselineAgentError
+      const failed = turnErrorNew || agentErrorNew
       const message = failed
         ? (detail?.failureMessage ?? detail?.lastAgentError ?? '')
         : (detail?.finalText ?? '')
@@ -357,6 +389,7 @@ export function sessionDetailOf(
   let failureMessage: string | null = null
   let finalText = ''
   let lastUserText = ''
+  let latestUserSeq = 0
   if (chat !== undefined) {
     for (const node of chat.nodes.values()) {
       if (node.kind === 'turn-error') {
@@ -373,8 +406,11 @@ export function sessionDetailOf(
           .join('')
         if (text.length > 0) finalText = text
       } else if (node.kind === 'user') {
+        const data = node.data as { seq?: number, content: readonly { type: string, text?: string }[], source?: { kind?: string } }
+        if (typeof data.seq === 'number' && data.seq > latestUserSeq) {
+          latestUserSeq = data.seq
+        }
         // Human messages only: goal rounds and other host prompts share the role.
-        const data = node.data as { content: readonly { type: string, text?: string }[], source?: { kind?: string } }
         if (data.source?.kind === 'user') {
           lastUserText = data.content
             .filter(block => block.type === 'text' && block.text !== undefined)
@@ -390,6 +426,7 @@ export function sessionDetailOf(
     lastAgentError: session.lastAgentError,
     finalText,
     lastUserText,
+    latestUserSeq,
   }
 }
 

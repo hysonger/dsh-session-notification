@@ -34,10 +34,10 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: the sessions service (ctx.sessions) and the chat/pending
 // surfaces the engine reads (ctx.uiConversation / ctx.uiSession).
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
-import type { SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionBinding, SessionSnapshot } from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {
-  SessionStatusSnapshot,
+  SessionPendingInteraction,
 } from '@deepseek-ai/dsh-client-ui-session/client'
 // Type-only: the workspace navigation merge (ctx.uiWorkspace). Injected
 // optionally so a composition without it keeps the plugin running.
@@ -53,7 +53,7 @@ import {
 import { MAX_CUSTOM_AUDIO_BYTES, readCustomSound, readFileAsDataUrl, writeCustomSound } from './custom-audio.ts'
 import {
   NotificationDispatcher, NotificationEngine, sessionDetailOf,
-  type ChatSnapshotLike, type PendingFacts,
+  type ChatSnapshotLike, type PendingFacts, type SessionDetail,
 } from './notification-service.ts'
 import { createNotificationsStore } from './settings-store.ts'
 import {
@@ -151,44 +151,56 @@ export function apply(ctx: ClientContext): void {
     hasFocus: () => typeof document === 'undefined' || document.hasFocus(),
   })
 
+  const readBindingDetail = (binding: SessionBinding): SessionDetail | undefined => {
+    // The session snapshot carries no chat view: the conversation nodes
+    // live in the uiConversation chat target, materialized only while a
+    // reference retains the `conversation` facet (dsh 0.2.2-rc.3+). Absent it,
+    // classification still has lastAgentError. A generation that ends between
+    // the running edge and this read makes the binding calls throw, so a
+    // failed read degrades to "no detail".
+    try {
+      const conversation = ctx.uiConversation.binding(binding) as unknown as {
+        activate(target: string): void
+        target(key: string): { getSnapshot(): unknown }
+      }
+      // Reading a target source does not activate it in 0.1.7+; without
+      // activation the chat nodes this classification needs stay absent for
+      // every session the shell has not selected.
+      conversation.activate('chat')
+      const chat = conversation.target('chat').getSnapshot() as ChatSnapshotLike | undefined
+      const session = binding.session.getSnapshot() as unknown as SessionSnapshot
+      return sessionDetailOf(session, chat)
+    } catch {
+      return undefined
+    }
+  }
+
   const engine = new NotificationEngine({
     detailOf: (id: SessionId) => {
       const binding = ctx.sessions.binding(id)
       if (binding === undefined) return undefined
-      // The session snapshot carries no chat view: the conversation nodes
-      // live in the uiConversation chat target, materialized only for opened
-      // sessions. Absent it, classification still has lastAgentError.
-      // (The chat target key and the session snapshot shape are surfaced
-      // through their owning packages' type merges; the structural casts keep
-      // this plugin independent of those augmentation orders.) A generation
-      // that ends between the running edge and this read makes the binding
-      // calls throw in 0.1.7, so a failed read degrades to "no detail".
-      try {
-        const conversation = ctx.uiConversation.binding(binding) as unknown as {
-          activate(target: string): void
-          target(key: string): { getSnapshot(): unknown }
-        }
-        // Reading a target source does not activate it in 0.1.7+; without
-        // activation the chat nodes this classification needs stay absent for
-        // every session the shell has not selected.
-        conversation.activate('chat')
-        const chat = conversation.target('chat').getSnapshot() as ChatSnapshotLike | undefined
-        const session = binding.session.getSnapshot() as unknown as SessionSnapshot
-        return sessionDetailOf(session, chat)
-      } catch {
-        return undefined
-      }
+      return readBindingDetail(binding)
     },
-    // Open a session the UI never opened so its chat view can assemble the
-    // final assistant text; skipped when no alert could use it.
+    // Open a session the UI never opened (or one without the `conversation`
+    // facet retained) and read its detail while the temporary reference is
+    // live, before `using` retires the scope. Skipped when no alert could use it.
     ensureDetail: async (id) => {
       const settings = currentSettings()
-      if (!settings.browserEnabled && !settings.soundEnabled) return
-      if (!Object.values(settings.types).some(type => type.enabled)) return
+      if (!settings.browserEnabled && !settings.soundEnabled) return undefined
+      if (!Object.values(settings.types).some(type => type.enabled)) return undefined
+      const existing = ctx.sessions.binding(id)
+      if (existing !== undefined && (ctx.sessions.retainInfo(id).getSnapshot().retainedFacets?.conversation ?? 0) > 0) {
+        return readBindingDetail(existing)
+      }
       try {
-        await ctx.sessions.using(id, { source: 'sessionNotification' }, async () => {})
+        return await ctx.sessions.using(
+          id,
+          { source: 'sessionNotification', facets: { conversation: true } },
+          (reference) => readBindingDetail(reference.binding),
+        )
       } catch (error) {
         console.warn('[dsh-session-notification] could not load the notification session', id, error)
+        return undefined
       }
     },
     titleOf: (id: SessionId) => ctx.sessions.list.getSnapshot().byId[id]?.displayTitle ?? id,
@@ -252,15 +264,15 @@ export function apply(ctx: ClientContext): void {
     return unsubscribe
   }, 'dsh-session-notification: session watch')
 
-  // dsh 0.1.7 unified the pending-interaction map into the uiSession session
-  // status source (running + pendingInteraction + completionUnread per
-  // session): observe its pendingInteraction values for question/approval
-  // edges.
-  const pendingFactsOf = (statuses: SessionStatusSnapshot): Map<SessionId, PendingFacts> => {
+  // dsh 0.2.2-rc.2 extracted `ctx.uiSession.sessionStatus` into the separate
+  // `uiSession.sessionStatus` service (`@deepseek-ai/dsh-client-ui-session-status`)
+  // while keeping pending interactions directly on `uiSession` via the
+  // read-only `ctx.uiSession.pendingInteractions` source.
+  const pendingFactsOf = (
+    pending: ReadonlyMap<SessionId, SessionPendingInteraction>,
+  ): Map<SessionId, PendingFacts> => {
     const out = new Map<SessionId, PendingFacts>()
-    for (const [id, status] of statuses) {
-      const interaction = status.pendingInteraction
-      if (interaction === undefined) continue
+    for (const [id, interaction] of pending) {
       const kind = interaction.kind === 'approval'
         ? 'approval' as const
         : (interaction.kind === 'question' || interaction.kind === 'plan-review')
@@ -274,9 +286,15 @@ export function apply(ctx: ClientContext): void {
     }
     return out
   }
-  ctx.effect(() => ctx.uiSession.sessionStatus.subscribe(() => {
-    engine.observePending(pendingFactsOf(ctx.uiSession.sessionStatus.getSnapshot()))
-  }), 'dsh-session-notification: pending watch')
+  ctx.effect(() => {
+    const unsubscribe = ctx.uiSession.pendingInteractions.subscribe(() => {
+      engine.observePending(pendingFactsOf(ctx.uiSession.pendingInteractions.getSnapshot()))
+    })
+    // Establish the baseline so interactions already pending when the plugin
+    // loads raise nothing even after another session later becomes pending.
+    engine.seedPending(pendingFactsOf(ctx.uiSession.pendingInteractions.getSnapshot()))
+    return unsubscribe
+  }, 'dsh-session-notification: pending watch')
 
   /** Persist one top-level preference through the scope, mirroring optimistically. */
   const persist = (field: 'browserEnabled' | 'currentNotificationMode' | 'notificationMode' | 'soundEnabled' | 'volume', value: unknown): void => {
